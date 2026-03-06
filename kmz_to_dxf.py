@@ -109,12 +109,20 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# Namespace KML
+# Namespace KML — detección automática
 # ─────────────────────────────────────────────
-KML_NS = "http://www.opengis.net/kml/2.2"
+# Algunos KMZ usan namespace distinto o ninguno.
+# Detectamos el namespace real del archivo.
 
-def tag(name):
-    return f"{{{KML_NS}}}{name}"
+def get_namespace(root):
+    """Extrae el namespace del elemento raíz, si existe."""
+    tag = root.tag
+    if tag.startswith("{"):
+        return tag.split("}")[0] + "}"
+    return ""
+
+def tag(name, ns=""):
+    return f"{ns}{name}"
 
 # ─────────────────────────────────────────────
 # Parsear coordenadas desde texto KML
@@ -136,15 +144,15 @@ def parse_coords(coord_text):
 # ─────────────────────────────────────────────
 # Procesar cada Placemark
 # ─────────────────────────────────────────────
-def process_placemark(placemark, msp, layer_name, stats):
+def process_placemark(placemark, msp, layer_name, stats, ns):
     """Lee un Placemark y lo agrega al modelspace DXF"""
     
     # Nombre del placemark (para etiqueta)
-    name_el = placemark.find(tag("name"))
+    name_el = placemark.find(tag("name", ns))
     name = name_el.text.strip() if name_el is not None and name_el.text else ""
 
     # ── Punto ──────────────────────────────────
-    point_el = placemark.find(f".//{tag('Point')}/{tag('coordinates')}")
+    point_el = placemark.find(f".//{tag('Point', ns)}/{tag('coordinates', ns)}")
     if point_el is not None and point_el.text:
         coords = parse_coords(point_el.text)
         if coords:
@@ -162,7 +170,7 @@ def process_placemark(placemark, msp, layer_name, stats):
             stats["puntos"] += 1
 
     # ── Línea ──────────────────────────────────
-    line_el = placemark.find(f".//{tag('LineString')}/{tag('coordinates')}")
+    line_el = placemark.find(f".//{tag('LineString', ns)}/{tag('coordinates', ns)}")
     if line_el is not None and line_el.text:
         coords = parse_coords(line_el.text)
         if len(coords) >= 2:
@@ -173,11 +181,12 @@ def process_placemark(placemark, msp, layer_name, stats):
             stats["lineas"] += 1
 
     # ── Polígono ────────────────────────────────
-    poly_el = placemark.find(f".//{tag('Polygon')}//{tag('outerBoundaryIs')}//{tag('coordinates')}")
+    poly_el = placemark.find(
+        f".//{tag('Polygon', ns)}//{tag('outerBoundaryIs', ns)}//{tag('coordinates', ns)}"
+    )
     if poly_el is not None and poly_el.text:
         coords = parse_coords(poly_el.text)
         if len(coords) >= 3:
-            # Cerrar polígono si no está cerrado
             if coords[0] != coords[-1]:
                 coords.append(coords[0])
             msp.add_lwpolyline(
@@ -190,9 +199,9 @@ def process_placemark(placemark, msp, layer_name, stats):
 # ─────────────────────────────────────────────
 # Recorrer Folders recursivamente
 # ─────────────────────────────────────────────
-def process_folder(folder, msp, parent_name, stats, layer_map):
+def process_folder(folder, msp, parent_name, stats, layer_map, ns):
     """Procesa una carpeta KML y sus subcarpetas"""
-    name_el = folder.find(tag("name"))
+    name_el = folder.find(tag("name", ns))
     folder_name = name_el.text.strip() if name_el is not None and name_el.text else parent_name
 
     # Nombre de capa limpio para DXF (máx 31 chars, sin caracteres especiales)
@@ -203,12 +212,12 @@ def process_folder(folder, msp, parent_name, stats, layer_map):
     layer_map[layer_name] = layer_map.get(layer_name, 0)
 
     # Placemarks directos en esta carpeta
-    for placemark in folder.findall(tag("Placemark")):
-        process_placemark(placemark, msp, layer_name, stats)
+    for placemark in folder.findall(tag("Placemark", ns)):
+        process_placemark(placemark, msp, layer_name, stats, ns)
 
     # Subcarpetas
-    for subfolder in folder.findall(tag("Folder")):
-        process_folder(subfolder, msp, layer_name, stats, layer_map)
+    for subfolder in folder.findall(tag("Folder", ns)):
+        process_folder(subfolder, msp, layer_name, stats, layer_map, ns)
 
 # ─────────────────────────────────────────────
 # Función principal de conversión
@@ -227,27 +236,38 @@ def kmz_to_dxf(kmz_bytes):
     # Parsear KML
     root = etree.fromstring(kml_content)
 
+    # Detectar namespace automáticamente
+    ns = get_namespace(root)
+
     # Crear documento DXF
     doc = ezdxf.new(dxfversion="R2010")
     msp = doc.modelspace()
 
     # Procesar contenido del KML
-    document_el = root.find(tag("Document"))
+    document_el = root.find(tag("Document", ns))
     container = document_el if document_el is not None else root
 
     # Placemarks en raíz
-    for placemark in container.findall(tag("Placemark")):
-        process_placemark(placemark, msp, "GENERAL", stats)
+    for placemark in container.findall(tag("Placemark", ns)):
+        process_placemark(placemark, msp, "GENERAL", stats, ns)
 
     # Carpetas
-    for folder in container.findall(tag("Folder")):
-        process_folder(folder, msp, "GENERAL", stats, layer_map)
+    for folder in container.findall(tag("Folder", ns)):
+        process_folder(folder, msp, "GENERAL", stats, layer_map, ns)
 
-    # Guardar DXF en memoria
-    output = io.BytesIO()
+    # Guardar DXF en memoria (ezdxf escribe texto, no bytes)
+    output = io.StringIO()
     doc.write(output)
-    output.seek(0)
-    return output.read(), stats, list(doc.layers)
+    dxf_str = output.getvalue()
+    # Convertir a bytes para la descarga
+    dxf_bytes = dxf_str.encode("utf-8")
+
+    # Obtener capas reales usadas (desde las entidades)
+    used_layers = sorted(set(
+        e.dxf.layer for e in msp
+        if hasattr(e.dxf, "layer") and e.dxf.layer not in ("0", "Defpoints")
+    ))
+    return dxf_bytes, stats, used_layers
 
 # ─────────────────────────────────────────────
 # UI - Upload
@@ -281,10 +301,9 @@ if uploaded_file:
                 """, unsafe_allow_html=True)
 
                 # Capas generadas
-                layer_names = [l.dxf.name for l in layers if l.dxf.name not in ("0", "Defpoints")]
-                if layer_names:
+                if layers:
                     st.markdown("**Capas generadas en el DXF:**")
-                    for ln in layer_names:
+                    for ln in layers:
                         st.markdown(f'<div class="layer-item">▸ {ln}</div>', unsafe_allow_html=True)
 
                 # Botón de descarga
